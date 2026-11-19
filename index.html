@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mini Redis</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; background: #f4f6fb; color: #222; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 4px; }
+    .sub { color: #666; margin: 0 0 20px; }
+    .layout { display: grid; grid-template-columns: 360px 1fr; gap: 20px; }
+    .panel { background: #fff; border-radius: 12px; padding: 18px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    label { display: block; font-size: 13px; color: #555; margin: 8px 0 4px; }
+    input { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+    .btns { display: flex; gap: 8px; margin-top: 12px; }
+    button { flex: 1; padding: 9px; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; color: #fff; }
+    .set { background: #4d96ff; } .get { background: #6bcb77; } .del { background: #ff6b6b; }
+    .log { margin-top: 16px; font-family: Consolas, monospace; font-size: 12px; background: #1e1e2e; color: #d6deeb;
+           border-radius: 8px; padding: 10px; height: 260px; overflow-y: auto; white-space: pre-wrap; }
+    .log .req { color: #82aaff; } .log .ok { color: #addb67; } .log .err { color: #ff7a85; }
+    .stats { display: flex; gap: 16px; font-size: 14px; margin-bottom: 12px; }
+    .stats b { color: #4d96ff; }
+    .bucket { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px dashed #eee; min-height: 40px; }
+    .idx { width: 44px; text-align: center; font-weight: 700; color: #999; background: #f1f3f7; border-radius: 6px; padding: 6px 0; }
+    .cell { border: 1px solid #cfe0ff; background: #eef4ff; border-radius: 8px; padding: 4px 10px; font-size: 13px; }
+    .cell .ttl { color: #888; font-size: 11px; margin-left: 4px; }
+    .cell.expired { background: #f3f3f3; border-color: #ddd; color: #aaa; text-decoration: line-through; }
+    .arrow { color: #bbb; }
+    .empty { color: #ccc; font-size: 13px; }
+    .tables { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    .tables.two { grid-template-columns: 1fr 1fr; }
+    h3 { font-size: 14px; margin: 0 0 6px; color: #555; }
+    .rehash { font-size: 13px; margin-bottom: 10px; color: #b7791f; font-weight: 600; min-height: 18px; }
+    .bucket.next .idx { background: #ffe8a3; color: #8a5a00; }
+    .race { margin-top: 20px; }
+    .race-inputs { display: flex; gap: 16px; }
+    .race-inputs label { flex: 1; }
+    .race .btns { max-width: 720px; }
+    .race-result { margin-top: 14px; font-size: 15px; line-height: 1.8; }
+    .race-result .bad { color: #e5484d; font-weight: 700; }
+    .race-result .good { color: #2f9e44; font-weight: 700; }
+    .hint { font-size: 12px; color: #888; margin-top: 10px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🧰 Mini Redis</h1>
+  <p class="sub">직접 만든 해시 테이블 위의 키-값 저장소</p>
+
+  <div class="layout">
+    <!-- 왼쪽: 명령 보내기 -->
+    <section class="panel">
+      <h2>명령</h2>
+      <label>키</label>
+      <input id="key" placeholder="예: name" />
+      <label>값 (저장할 때만)</label>
+      <input id="value" placeholder="예: 철수" />
+      <label>TTL 초 (비우면 만료 없음)</label>
+      <input id="ttl" type="number" min="1" placeholder="예: 10" />
+      <div class="btns">
+        <button class="set" onclick="setKey()">SET</button>
+        <button class="get" onclick="getKey()">GET</button>
+        <button class="del" onclick="delKey()">DEL</button>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
+
+    <!-- 오른쪽: 해시 테이블 내부 -->
+    <section class="panel">
+      <h2>해시 테이블 내부</h2>
+      <div class="stats">
+        <span>칸 개수 <b id="cap">-</b></span>
+        <span>저장 개수 <b id="size">-</b></span>
+        <span>로드 팩터 <b id="lf">-</b> (1 이상이면 칸 2배)</span>
+      </div>
+      <div id="rehash" class="rehash"></div>
+      <div class="tables">
+        <div><h3 id="ht0-title">ht[0]</h3><div id="ht0"></div></div>
+        <div id="ht1-wrap" style="display:none"><h3 id="ht1-title">ht[1] (새 테이블)</h3><div id="ht1"></div></div>
+      </div>
+      <p class="hint">
+        · 같은 칸에 여러 키가 있으면 충돌 → 리스트로 이어서 저장(체이닝)<br>
+        · TTL이 끝난 키는 0.1초 안에 자동으로 사라짐(Active 삭제). 그 사이에 GET 해도 바로 지워짐(Lazy 삭제)<br>
+        · 키 수가 칸 수만큼 차면 2배 테이블(ht[1])을 만들고, 명령이 올 때마다 ht[0]의 칸을 하나씩 옮김(점진적 rehash)<br>
+        · 노란 칸 = 다음에 옮길 칸
+      </p>
+    </section>
+  </div>
+
+  <!-- 아래: 동시성 실험 -->
+  <section class="panel race">
+    <h2>동시성 실험: 카운터 올리기</h2>
+    <p class="hint" style="margin-top:0">
+      같은 키를 동시에 N번 +1 했을 때 결과가 N인지 확인해요.<br>
+      · <b>GET + PUT</b>: 값을 읽고(GET) → +1 해서 → 저장(PUT). 두 명령 사이에 다른 요청이 끼어들 수 있음<br>
+      · <b>INCR</b>: 읽기·더하기·저장을 서버가 락 안에서 한 번에 처리
+    </p>
+    <div class="race-inputs">
+      <label>키 <input id="race-key" value="count" /></label>
+      <label>동시 요청 수 <input id="race-n" type="number" min="1" max="1000" value="100" /></label>
+    </div>
+    <div class="btns">
+      <button class="get" onclick="raceGetPut()">GET + PUT 으로 +1 × N</button>
+      <button class="set" onclick="raceIncr()">INCR 로 +1 × N</button>
+      <button class="del" onclick="raceReset()">0으로 초기화</button>
+    </div>
+    <div id="race-result" class="race-result"></div>
+  </section>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function log(cls, text) {
+    const line = document.createElement("div");
+    line.className = cls;
+    line.textContent = text;
+    $("log").prepend(line);
+  }
+
+  // API 호출 + 왼쪽 로그에 요청/응답 표시
+  async function call(method, key, body) {
+    if (!key) return log("err", "키를 입력하세요");
+    const url = "/keys/" + encodeURIComponent(key);
+    log("req", `${method} ${url}${body ? " " + JSON.stringify(body) : ""}`);
+    const res = await fetch(url, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json();
+    log(res.ok ? "ok" : "err", `← ${res.status} ${JSON.stringify(data)}`);
+    refresh();
+  }
+
+  function setKey() {
+    const body = { value: $("value").value };
+    if ($("ttl").value) body.ttl = Number($("ttl").value);
+    call("PUT", $("key").value.trim(), body);
+  }
+  function getKey() { call("GET", $("key").value.trim()); }
+  function delKey() { call("DELETE", $("key").value.trim()); }
+
+  // 오른쪽: /debug로 해시 테이블 내부를 받아서 그림 (1초마다)
+  async function refresh() {
+    const res = await fetch("/debug");
+    const d = await res.json();
+    $("cap").textContent = d.capacity;
+    $("size").textContent = d.size;
+    $("lf").textContent = d.load_factor;
+
+    $("rehash").textContent = d.rehashing
+      ? `↻ 늘리는 중: ht[0]의 ${d.rehash_idx}번 칸부터 옮길 차례 (명령을 보낼 때마다 한 칸씩 이동)`
+      : "";
+
+    $("ht0-title").textContent = `ht[0] (${d.ht0.length}칸)`;
+    $("ht0").innerHTML = drawTable(d.ht0, d.rehashing ? d.rehash_idx : -1);
+
+    const two = d.ht1 !== null;
+    $("ht1-wrap").style.display = two ? "" : "none";
+    document.querySelector(".tables").classList.toggle("two", two);
+    if (two) {
+      $("ht1-title").textContent = `ht[1] 새 테이블 (${d.ht1.length}칸)`;
+      $("ht1").innerHTML = drawTable(d.ht1, -1);
+    }
+  }
+
+  // 테이블 하나를 칸 목록으로 그림. nextIdx 칸은 노랗게 표시
+  function drawTable(buckets, nextIdx) {
+    return buckets.map((cells, i) => {
+      const inner = cells.length === 0
+        ? '<span class="empty">비어 있음</span>'
+        : cells.map((c) => {
+            const ttl = c.ttl === null ? "" : `<span class="ttl">${c.expired ? "만료" : c.ttl + "s"}</span>`;
+            const v = typeof c.value === "object" ? JSON.stringify(c.value) : c.value;   // 객체 값은 JSON으로 표시
+            return `<span class="cell ${c.expired ? "expired" : ""}">${c.key} : ${v}${ttl}</span>`;
+          }).join('<span class="arrow">→</span>');
+      return `<div class="bucket ${i === nextIdx ? "next" : ""}"><span class="idx">[${i}]</span>${inner}</div>`;
+    }).join("");
+  }
+
+  // ── 동시성 실험 ──
+  const raceKey = () => $("race-key").value.trim() || "count";
+  const raceN = () => Math.max(1, Math.min(1000, Number($("race-n").value) || 100));
+  const keyUrl = (k) => "/keys/" + encodeURIComponent(k);
+
+  async function readCount(key) {
+    const res = await fetch(keyUrl(key));
+    if (!res.ok) return 0;                       // 키가 없으면 0
+    return (await res.json()).value;
+  }
+
+  // 결과 표시: 시작값 + N 이 나와야 정상
+  function showRace(name, before, after, n, ms) {
+    const expected = before + n;
+    const lost = expected - after;
+    $("race-result").innerHTML =
+      `<b>${name}</b> ${n}번 동시 실행 (${ms}ms)<br>` +
+      `시작값 ${before} → 기대값 <b>${expected}</b> / 실제값 <b>${after}</b><br>` +
+      (lost > 0
+        ? `<span class="bad">✗ ${lost}번의 +1이 사라짐 (갱신 손실)</span>`
+        : `<span class="good">✓ 하나도 빠짐없이 정확함</span>`);
+    refresh();
+  }
+
+  // GET으로 읽고 → +1 → PUT으로 저장 를 N개 동시에
+  async function raceGetPut() {
+    const key = raceKey(), n = raceN();
+    const before = await readCount(key);
+    if (typeof before !== "number") return $("race-result").textContent = "값이 숫자가 아니에요. 먼저 0으로 초기화하세요.";
+    const start = performance.now();
+    await Promise.all(Array.from({ length: n }, async () => {
+      const v = await readCount(key);                                 // ① 읽기
+      await fetch(keyUrl(key), {                                       // ② +1 해서 저장
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: v + 1 }),
+      });
+    }));
+    showRace("GET + PUT", before, await readCount(key), n, Math.round(performance.now() - start));
+  }
+
+  // INCR를 N개 동시에
+  async function raceIncr() {
+    const key = raceKey(), n = raceN();
+    const before = await readCount(key);
+    if (typeof before !== "number") return $("race-result").textContent = "값이 숫자가 아니에요. 먼저 0으로 초기화하세요.";
+    const start = performance.now();
+    await Promise.all(Array.from({ length: n }, () =>
+      fetch("/incr/" + encodeURIComponent(key), { method: "POST" })
+    ));
+    showRace("INCR", before, await readCount(key), n, Math.round(performance.now() - start));
+  }
+
+  async function raceReset() {
+    await fetch(keyUrl(raceKey()), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value: 0 }),
+    });
+    $("race-result").textContent = `${raceKey()} = 0 으로 초기화했어요`;
+    refresh();
+  }
+
+  refresh();
+  setInterval(refresh, 1000);
+</script>
+</body>
+</html>
